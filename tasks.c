@@ -10,11 +10,16 @@ TaskHandle_t speedSensingHandle = NULL;
 TaskHandle_t displayUpdateHandle = NULL;
 TaskHandle_t switchMonitorHandle = NULL;
 TaskHandle_t ultrasonicTaskHandle = NULL;
-// Semaphore/mutex for LCD access
-SemaphoreHandle_t lcdMutex = NULL;
+TaskHandle_t alertHandlerHandle = NULL;
 
-// Queue for speed updates
+// Semaphores/mutexes
+SemaphoreHandle_t lcdMutex = NULL;
+SemaphoreHandle_t rgbLedMutex = NULL;
+SemaphoreHandle_t buzzerMutex = NULL;
+
+// Queues
 QueueHandle_t speedQueue = NULL;
+QueueHandle_t distanceQueue = NULL;
 
 // System state
 SystemState_t systemState = {
@@ -22,7 +27,8 @@ SystemState_t systemState = {
     .doorsLocked = false,
     .ignitionOn = false,
     .manualLockOverride = false,
-    .gearPosition = GEAR_PARK  // Initialize to PARK
+    .gearPosition = GEAR_PARK,  // Initialize to PARK
+    .parkingAssistActive = false
 };
 
 // GPIO initialization for switches
@@ -96,18 +102,24 @@ void tasks_init(void) {
     // Initialize ultrasonic system
     ultrasonic_system_init();
     
-    // Create mutex for LCD access
+    // Create semaphores/mutexes
     lcdMutex = xSemaphoreCreateMutex();
+    rgbLedMutex = xSemaphoreCreateMutex();
+    buzzerMutex = xSemaphoreCreateMutex();
     
-    // Create queue for speed updates
+    // Create queues
     speedQueue = xQueueCreate(1, sizeof(uint32_t));
+    distanceQueue = xQueueCreate(1, sizeof(uint32_t));
     
-    // Create tasks
-    if (lcdMutex != NULL && speedQueue != NULL) {
+    // Create tasks if resources were created successfully
+    if (lcdMutex != NULL && rgbLedMutex != NULL && buzzerMutex != NULL && 
+        speedQueue != NULL && distanceQueue != NULL) {
+        
         xTaskCreate(SpeedSensingTask, "SpeedSensing", configMINIMAL_STACK_SIZE, NULL, 2, &speedSensingHandle);
         xTaskCreate(DisplayUpdateTask, "DisplayUpdate", configMINIMAL_STACK_SIZE, NULL, 1, &displayUpdateHandle);
         xTaskCreate(SwitchMonitorTask, "SwitchMonitor", configMINIMAL_STACK_SIZE, NULL, 3, &switchMonitorHandle);
         xTaskCreate(UltrasonicTask, "Ultrasonic", configMINIMAL_STACK_SIZE, NULL, 2, &ultrasonicTaskHandle);
+        xTaskCreate(AlertHandlerTask, "AlertHandler", configMINIMAL_STACK_SIZE, NULL, 2, &alertHandlerHandle);
     } else {
         // Handle resource creation failure
         while(1) {}
@@ -147,7 +159,7 @@ void SpeedSensingTask(void *pvParameters) {
             }
             
             // Auto-lock doors if speed exceeds threshold and no manual override is active
-            if (speedValue >= 10 && !systemState.doorsLocked && !systemState.manualLockOverride) {
+            if (speedValue >= 60 && !systemState.doorsLocked && !systemState.manualLockOverride) {
                 systemState.doorsLocked = true;
             }
         } else {
@@ -284,8 +296,7 @@ void UltrasonicTask(void *pvParameters) {
     uint32_t pulseWidth;
     uint32_t startTime, endTime;
     TickType_t lastWakeTime;
-    TickType_t buzzerDelay = pdMS_TO_TICKS(1000); // Default delay (slow beeping)
-    bool buzzerState = false;
+    const TickType_t measurementPeriod = pdMS_TO_TICKS(100); // 100ms measurement period
     
     // Initialize the last wake time
     lastWakeTime = xTaskGetTickCount();
@@ -335,43 +346,85 @@ void UltrasonicTask(void *pvParameters) {
             // Adjust calculation based on tick rate and units
             distance = (pulseWidth * 343 * 100) / (2 * configTICK_RATE_HZ);
             
-            // 7. Update system state with the current distance
-            systemState.distanceCm = distance;
-            
-            // 8. Set RGB LED based on distance
-            if (distance < DANGER_ZONE) {
-                // Red - Danger zone
-                GPIOF->DATA = (GPIOF->DATA & ~(BLUE_PIN | GREEN_PIN)) | RED_PIN;
-                buzzerDelay = pdMS_TO_TICKS(100); // Fast beeping (100ms)
-            } else if (distance < CAUTION_ZONE) {
-                // Yellow - Caution zone (Red + Green)
-                GPIOF->DATA = (GPIOF->DATA & ~BLUE_PIN) | (RED_PIN | GREEN_PIN);
-                buzzerDelay = pdMS_TO_TICKS(300); // Medium beeping (300ms)
-            } else {
-                // Green - Safe zone
-                GPIOF->DATA = (GPIOF->DATA & ~(RED_PIN | BLUE_PIN)) | GREEN_PIN;
-                buzzerDelay = pdMS_TO_TICKS(1000); // Slow beeping (1000ms)
+            // 7. Send distance measurement to queue (overwrite previous value if not consumed)
+            xQueueOverwrite(distanceQueue, &distance);
+        } else {
+            // If not in reverse, send a large value to indicate "no obstacle"
+            distance = 0xFFFFFFFF;
+            xQueueOverwrite(distanceQueue, &distance);
+        }
+        
+        // Wait for the next measurement cycle
+        vTaskDelayUntil(&lastWakeTime, measurementPeriod);
+    }
+}
+
+void AlertHandlerTask(void *pvParameters) {
+    uint32_t currentDistance;
+    TickType_t buzzerDelay = pdMS_TO_TICKS(1000); // Default delay
+    TickType_t lastWakeTime;
+    bool buzzerState = false;
+    
+    // Initialize last wake time
+    lastWakeTime = xTaskGetTickCount();
+    
+    while(1) {
+        // Try to receive latest distance from queue (non-blocking)
+        if (xQueueReceive(distanceQueue, &currentDistance, 0) != pdTRUE) {
+            // If no new distance data, use a very large value
+            currentDistance = 0xFFFFFFFF;
+        }
+        
+        // Determine action based on distance and parking assist state
+        if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
+            // Take mutexes to access RGB LED and buzzer
+            if (xSemaphoreTake(rgbLedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                // Set RGB LED based on distance
+                if (currentDistance < DANGER_ZONE) {
+                    // Red - Danger zone
+                    GPIOF->DATA = (GPIOF->DATA & ~(BLUE_PIN | GREEN_PIN)) | RED_PIN;
+                    buzzerDelay = pdMS_TO_TICKS(100); // Fast beeping (100ms)
+                } else if (currentDistance < CAUTION_ZONE) {
+                    // Yellow - Caution zone (Red + Green)
+                    GPIOF->DATA = (GPIOF->DATA & ~BLUE_PIN) | (RED_PIN | GREEN_PIN);
+                    buzzerDelay = pdMS_TO_TICKS(300); // Medium beeping (300ms)
+                } else {
+                    // Green - Safe zone
+                    GPIOF->DATA = (GPIOF->DATA & ~(RED_PIN | BLUE_PIN)) | GREEN_PIN;
+                    buzzerDelay = pdMS_TO_TICKS(1000); // Slow beeping (1000ms)
+                }
+                // Release RGB LED mutex
+                xSemaphoreGive(rgbLedMutex);
             }
             
-            // 9. Toggle buzzer based on determined frequency
-            buzzerState = !buzzerState;
-            if (buzzerState) {
-                GPIOA->DATA |= BUZZER_PIN;  // Turn buzzer on
-            } else {
-                GPIOA->DATA &= ~BUZZER_PIN; // Turn buzzer off
+            // Handle buzzer (toggle state based on frequency)
+            if (xSemaphoreTake(buzzerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                buzzerState = !buzzerState;
+                if (buzzerState) {
+                    GPIOA->DATA |= BUZZER_PIN;  // Turn buzzer on
+                } else {
+                    GPIOA->DATA &= ~BUZZER_PIN; // Turn buzzer off
+                }
+                xSemaphoreGive(buzzerMutex);
             }
         } else {
             // Parking assist not active - turn off all indicators
-            GPIOF->DATA &= ~(RED_PIN | BLUE_PIN | GREEN_PIN);
-            GPIOA->DATA &= ~BUZZER_PIN;
-            buzzerState = false;
-            systemState.distanceCm = 0;
+            if (xSemaphoreTake(rgbLedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                GPIOF->DATA &= ~(RED_PIN | BLUE_PIN | GREEN_PIN);
+                xSemaphoreGive(rgbLedMutex);
+            }
+            
+            if (xSemaphoreTake(buzzerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                GPIOA->DATA &= ~BUZZER_PIN;
+                xSemaphoreGive(buzzerMutex);
+                buzzerState = false;
+            }
             
             // Use a standard delay when not in active mode
             buzzerDelay = pdMS_TO_TICKS(200);
         }
         
-        // Wait for the next cycle
+        // Wait for the next alert cycle - this controls the buzzer beep frequency
         vTaskDelayUntil(&lastWakeTime, buzzerDelay);
     }
 }
@@ -382,11 +435,17 @@ void DisplayUpdateTask(void *pvParameters) {
     char gearStr[8];
     char distanceStr[16];
     uint32_t currentSpeed = 0;
+    uint32_t currentDistance = 0xFFFFFFFF; // Default to a large value
     
     while(1) {
         // Receive latest speed value from queue with a timeout
-        if (xQueueReceive(speedQueue, &currentSpeed, pdMS_TO_TICKS(10)) != pdTRUE) {
+        if (xQueuePeek(speedQueue, &currentSpeed, pdMS_TO_TICKS(10)) != pdTRUE) {
             // Queue receive timed out, use last known value
+        }
+        
+        // Receive latest distance value from queue with a timeout
+        if (xQueuePeek(distanceQueue, &currentDistance, pdMS_TO_TICKS(10)) != pdTRUE) {
+            // Queue receive timed out, use last known value or default
         }
         
         // Take mutex to access LCD
@@ -403,7 +462,7 @@ void DisplayUpdateTask(void *pvParameters) {
             LCD_Set_Cursor(0, 7);
             LCD_Print(speedStr);
             
-            // Display gear, ignition, and door status on second line
+            // Display gear, ignition, and door/distance status on second line
             LCD_Set_Cursor(1, 0);
             
             // Get gear string
@@ -423,16 +482,16 @@ void DisplayUpdateTask(void *pvParameters) {
             }
             
             // If in reverse with parking assist, show distance instead of door status
-            if (systemState.parkingAssistActive) {
+            if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
                 sprintf(statusStr, "%sON ", gearStr);
                 
                 // Show distance in appropriate units and with zone indication
-                if (systemState.distanceCm < DANGER_ZONE) {
-                    sprintf(distanceStr, "%lucm!", systemState.distanceCm);
-                } else if (systemState.distanceCm < CAUTION_ZONE) {
-                    sprintf(distanceStr, "%lucm", systemState.distanceCm);
+                if (currentDistance < DANGER_ZONE) {
+                    sprintf(distanceStr, "%lucm!", currentDistance);
+                } else if (currentDistance < CAUTION_ZONE) {
+                    sprintf(distanceStr, "%lucm", currentDistance);
                 } else {
-                    sprintf(distanceStr, "%lucm", systemState.distanceCm);
+                    sprintf(distanceStr, "%lucm", currentDistance);
                 }
                 
                 strcat(statusStr, distanceStr);

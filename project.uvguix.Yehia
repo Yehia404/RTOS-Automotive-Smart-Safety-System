@@ -3451,7 +3451,7 @@
         <RecentRowIndex>0</RecentRowIndex>
         <RectRecentDocked>
           <Len>16</Len>
-          <Data>0000000000000000D10300001C000000</Data>
+          <Data>0100000000000000D20300001C000000</Data>
         </RectRecentDocked>
         <RectRecentFloat>
           <Len>16</Len>
@@ -3642,9 +3642,9 @@
       </Doc>
       <Doc>
         <Name>.\tasks.c</Name>
-        <ColumnNumber>1</ColumnNumber>
-        <TopLine>3</TopLine>
-        <CurrentLine>471</CurrentLine>
+        <ColumnNumber>31</ColumnNumber>
+        <TopLine>144</TopLine>
+        <CurrentLine>162</CurrentLine>
         <Folding>0</Folding>
         <ContractedFolders></ContractedFolders>
         <PaneID>0</PaneID>
