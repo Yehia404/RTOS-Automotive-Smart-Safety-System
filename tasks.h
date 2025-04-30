@@ -33,13 +33,14 @@ typedef enum
     GEAR_UNKNOWN
 } GearPosition_t;
 
-// Pin definitions
+// Pin definitions for switches and buttons
 #define IGNITION_PIN (1 << 4)     // PF4 for ignition switch
 #define LOCK_BTN_PIN (1 << 0)     // PB0 for lock button
 #define UNLOCK_BTN_PIN (1 << 1)   // PB1 for unlock button
 #define GEAR_PARK_PIN (1 << 0)    // PE0 for Park gear switch
 #define GEAR_DRIVE_PIN (1 << 1)   // PE1 for Drive gear switch
 #define GEAR_REVERSE_PIN (1 << 2) // PE2 for Reverse gear switch
+#define DOOR_SWITCH_PIN (1 << 5)  // PA5 for driver door switch (endstop limit switch)
 
 // Pin definitions for ultrasonic sensor
 #define TRIG_PIN (1 << 2) // PA2 for Trigger pin
@@ -60,12 +61,13 @@ typedef enum
 // Shared system state
 typedef struct
 {
-    uint32_t currentSpeed;
-    bool doorsLocked;
-    bool ignitionOn;
-    bool manualLockOverride;
-    GearPosition_t gearPosition; // Added for gear shifter
+    uint32_t currentSpeed;       // Current vehicle speed
+    bool doorsLocked;            // Door lock status
+    bool ignitionOn;             // Ignition state
+    bool manualLockOverride;     // Manual door lock override flag
+    GearPosition_t gearPosition; // Current gear position
     bool parkingAssistActive;    // Whether parking assist is active
+    bool driverDoorOpen;         // Driver door state (open/closed)
 } SystemState_t;
 
 extern SystemState_t systemState;
@@ -73,7 +75,7 @@ extern SystemState_t systemState;
 // Task initialization function
 void tasks_init(void);
 
-// GPIO initialization for switches
+// GPIO initialization for switches and inputs
 void switches_init(void);
 
 // GPIO initialization for ultrasonic, RGB LED, and buzzer

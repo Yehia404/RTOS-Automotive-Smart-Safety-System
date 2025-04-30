@@ -37,13 +37,15 @@ void switches_init(void) {
     SYSCTL->RCGCGPIO |= (1 << 5);  // Enable GPIOF clock for ignition button (PF4)
     SYSCTL->RCGCGPIO |= (1 << 1);  // Enable GPIOB clock for lock/unlock buttons (PB0, PB1)
     SYSCTL->RCGCGPIO |= (1 << 4);  // Enable GPIOE clock for gear shifter and potentiometer
+    SYSCTL->RCGCGPIO |= (1 << 0);  // Enable GPIOA clock for door switch (if not already enabled for ultrasonic)
     
     // Wait for clocks to stabilize
     while((SYSCTL->PRGPIO & (1 << 5)) == 0) {}
     while((SYSCTL->PRGPIO & (1 << 1)) == 0) {}
     while((SYSCTL->PRGPIO & (1 << 4)) == 0) {}
+    while((SYSCTL->PRGPIO & (1 << 0)) == 0) {}
     
-    // Configure PF4 as input with pull-up for ignition switch (push button)
+    // Configure PF4 as input with pull-up for ignition switch
     GPIOF->LOCK = 0x4C4F434B;         // Unlock GPIO registers
     GPIOF->CR = 0x1F;                 // Allow changes to PF4-0
     GPIOF->DIR &= ~IGNITION_PIN;      // Set as input
@@ -51,23 +53,25 @@ void switches_init(void) {
     GPIOF->DEN |= IGNITION_PIN;       // Enable digital function
     
     // Configure PB0 (Lock button) and PB1 (Unlock button) as inputs with pull-up
-    // Note: PB2 and PB3 are used for I2C LCD and configured in I2C initialization
     GPIOB->DIR &= ~(LOCK_BTN_PIN | UNLOCK_BTN_PIN); // Set as inputs
     GPIOB->PUR |= (LOCK_BTN_PIN | UNLOCK_BTN_PIN);  // Enable pull-up resistors
     GPIOB->DEN |= (LOCK_BTN_PIN | UNLOCK_BTN_PIN);  // Enable digital function
     
     // Configure PE0, PE1, PE2 as inputs with pull-ups for gear shifter
-    // Note: PE3 is used for potentiometer and configured in ADC initialization
     GPIOE->DIR &= ~(GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);  // Set as inputs
     GPIOE->PUR |= (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);   // Enable pull-up resistors
     GPIOE->DEN |= (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);   // Enable digital function
+    
+    // Configure PA5 as input with pull-up for door switch
+    GPIOA->DIR &= ~DOOR_SWITCH_PIN;   // Set as input
+    GPIOA->PUR |= DOOR_SWITCH_PIN;    // Enable pull-up resistor
+    GPIOA->DEN |= DOOR_SWITCH_PIN;    // Enable digital function
 }
 
 // Initialize ultrasonic sensor, RGB LED, and buzzer
 void ultrasonic_system_init(void) {
     // Enable clocks for required ports
     SYSCTL->RCGCGPIO |= (1 << 0);  // Enable GPIOA clock for ultrasonic sensor and buzzer
-    // GPIOF clock should already be enabled for the ignition button
     
     // Wait for clocks to stabilize
     while((SYSCTL->PRGPIO & (1 << 0)) == 0) {}
@@ -77,12 +81,18 @@ void ultrasonic_system_init(void) {
     GPIOA->DIR &= ~ECHO_PIN;       // Set Echo as input
     GPIOA->DEN |= (TRIG_PIN | ECHO_PIN); // Enable digital function
     
-    // Configure PA4 as output for buzzer
+    // Configure PA4 as output for buzzer with enhanced drive capability
     GPIOA->DIR |= BUZZER_PIN;      // Set as output
     GPIOA->DEN |= BUZZER_PIN;      // Enable digital function
+    GPIOA->DR8R |= BUZZER_PIN;     // Enable 8mA drive capability for buzzer
+    GPIOA->DATA &= ~BUZZER_PIN;    // Ensure buzzer is off initially
+    
+    // Configure PA5 as input with pull-up for door switch
+    GPIOA->DIR &= ~DOOR_SWITCH_PIN;// Set as input
+    GPIOA->PUR |= DOOR_SWITCH_PIN; // Enable pull-up
+    GPIOA->DEN |= DOOR_SWITCH_PIN; // Enable digital function
     
     // Configure PF1 (Red), PF2 (Blue), PF3 (Green) for RGB LED
-    // PF1 and PF2 may require unlocking
     GPIOF->LOCK = 0x4C4F434B;      // Unlock GPIO registers
     GPIOF->CR = 0x1F;              // Allow changes to PF0-PF4
     GPIOF->DIR |= (RED_PIN | BLUE_PIN | GREEN_PIN); // Set as outputs
@@ -183,26 +193,28 @@ void SwitchMonitorTask(void *pvParameters) {
     bool prevIgnitionBtn = true;
     bool prevLockBtn = true;
     bool prevUnlockBtn = true;
+    bool prevDoorSwitch = true;  // Previous state of door switch (HIGH = closed)
     
     bool currIgnitionBtn;
     bool currLockBtn;
     bool currUnlockBtn;
+    bool currDoorSwitch;         // Current state of door switch
     uint8_t gearSwitches;
     
     const TickType_t debounceDelay = pdMS_TO_TICKS(50);  // 50ms debounce delay
     
     while(1) {
         // Read all button states (active low with pull-up resistors)
-        currIgnitionBtn = (GPIOF->DATA & IGNITION_PIN) ? true : false;     // PF4 for ignition
-        currLockBtn = (GPIOB->DATA & LOCK_BTN_PIN) ? true : false;         // PB0 for lock
-        currUnlockBtn = (GPIOB->DATA & UNLOCK_BTN_PIN) ? true : false;     // PB1 for unlock
+        currIgnitionBtn = (GPIOF->DATA & IGNITION_PIN) ? true : false;      // PF4 for ignition
+        currLockBtn = (GPIOB->DATA & LOCK_BTN_PIN) ? true : false;          // PB0 for lock
+        currUnlockBtn = (GPIOB->DATA & UNLOCK_BTN_PIN) ? true : false;      // PB1 for unlock
+        currDoorSwitch = (GPIOA->DATA & DOOR_SWITCH_PIN) ? true : false;    // PA5 for door switch
         
         // Read gear position from switches (active low with pull-ups)
         // Read only the relevant bits (PE0-PE2)
         gearSwitches = (~GPIOE->DATA) & (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);
         
         // Update gear position based on switch setting
-        // This assumes that only one switch is active at a time
         if (gearSwitches & GEAR_PARK_PIN) {
             systemState.gearPosition = GEAR_PARK;
         } else if (gearSwitches & GEAR_DRIVE_PIN) {
@@ -247,6 +259,11 @@ void SwitchMonitorTask(void *pvParameters) {
                 systemState.doorsLocked = true;
                 // Set manual override flag to prevent auto lock/unlock based on speed
                 systemState.manualLockOverride = true;
+                
+                // If door is open when trying to lock, close it automatically (in reality, this would be a warning)
+                if (systemState.driverDoorOpen) {
+                    systemState.driverDoorOpen = false;
+                }
             }
         }
         
@@ -281,10 +298,58 @@ void SwitchMonitorTask(void *pvParameters) {
             }
         }
         
+        // Check for door switch state change
+        if (prevDoorSwitch != currDoorSwitch) {
+            // Debounce delay
+            vTaskDelay(debounceDelay);
+            
+            // Read switch state again to confirm change
+            currDoorSwitch = (GPIOA->DATA & DOOR_SWITCH_PIN) ? true : false;
+            
+            if (prevDoorSwitch != currDoorSwitch) {
+                // Attempt to open door (switch LOW)
+                if (!currDoorSwitch) {
+                    // Check if doors are locked
+                    if (systemState.doorsLocked) {
+                        // Door is locked, prevent opening - ignore switch press
+                        // Here you could add code to provide feedback (e.g., flash LED)
+                        
+                        // Flash the RGB LED red briefly to indicate door can't be opened
+                        if (xSemaphoreTake(rgbLedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            // Flash red LED
+                            GPIOF->DATA |= RED_PIN;
+                            GPIOF->DATA &= ~(BLUE_PIN | GREEN_PIN);
+                            xSemaphoreGive(rgbLedMutex);
+                            
+                            vTaskDelay(pdMS_TO_TICKS(200)); // Flash for 200ms
+                            
+                            // Turn off if no other alerts are active
+                            if (xSemaphoreTake(rgbLedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                // Only turn off if we're not in parking assist mode
+                                if (!systemState.parkingAssistActive) {
+                                    GPIOF->DATA &= ~(RED_PIN | BLUE_PIN | GREEN_PIN);
+                                }
+                                xSemaphoreGive(rgbLedMutex);
+                            }
+                        }
+                        
+                        // Door state remains unchanged (closed)
+                    } else {
+                        // Door is unlocked, allow opening
+                        systemState.driverDoorOpen = true;
+                    }
+                } else {
+                    // Door is being closed (switch HIGH)
+                    systemState.driverDoorOpen = false;
+                }
+            }
+        }
+        
         // Update previous states
         prevIgnitionBtn = currIgnitionBtn;
         prevLockBtn = currLockBtn;
         prevUnlockBtn = currUnlockBtn;
+        prevDoorSwitch = currDoorSwitch;
         
         // Task delay (20ms - fast enough to detect button presses)
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -361,23 +426,66 @@ void UltrasonicTask(void *pvParameters) {
 
 void AlertHandlerTask(void *pvParameters) {
     uint32_t currentDistance;
-    TickType_t buzzerDelay = pdMS_TO_TICKS(1000); // Default delay
+    TickType_t buzzerDelay = pdMS_TO_TICKS(200); // Default delay
     TickType_t lastWakeTime;
     bool buzzerState = false;
+    uint32_t currentSpeed = 0;
     
     // Initialize last wake time
     lastWakeTime = xTaskGetTickCount();
     
+    // One-time direct test of buzzer to check hardware
+    GPIOA->DATA |= BUZZER_PIN;  // Turn buzzer on
+    vTaskDelay(pdMS_TO_TICKS(500)); // Keep on for 500ms
+    GPIOA->DATA &= ~BUZZER_PIN; // Turn buzzer off
+    
     while(1) {
         // Try to receive latest distance from queue (non-blocking)
-        if (xQueueReceive(distanceQueue, &currentDistance, 0) != pdTRUE) {
+        if (xQueuePeek(distanceQueue, &currentDistance, 0) != pdTRUE) {
             // If no new distance data, use a very large value
             currentDistance = 0xFFFFFFFF;
         }
         
-        // Determine action based on distance and parking assist state
-        if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
-            // Take mutexes to access RGB LED and buzzer
+        // Get current speed
+        if (xQueuePeek(speedQueue, &currentSpeed, 0) != pdTRUE) {
+            // If no speed data, assume stopped
+            currentSpeed = 0;
+        }
+        
+        // Check for door open warning condition (door open while moving)
+        bool doorOpenWarning = systemState.driverDoorOpen && 
+                              systemState.ignitionOn && 
+                              currentSpeed > 0;
+        
+        // Determine action based on active warnings
+        if (doorOpenWarning) {
+            // Door open while moving warning - highest priority
+            buzzerDelay = pdMS_TO_TICKS(200); // Fast beeping for door warning
+            
+            // Toggle RGB LED - avoid using red only as it might conflict with onboard LED
+            if (xSemaphoreTake(rgbLedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                // Use a different color combination to avoid red-only conflicts
+                // Alternating between blue+green and all off
+                if (buzzerState) {
+                    GPIOF->DATA |= (BLUE_PIN | GREEN_PIN);  // Blue+Green on
+                    GPIOF->DATA &= ~RED_PIN;                // Red off
+                } else {
+                    GPIOF->DATA &= ~(RED_PIN | BLUE_PIN | GREEN_PIN); // All LEDs off
+                }
+                xSemaphoreGive(rgbLedMutex);
+            }
+            
+            // Direct control of buzzer without mutex for testing
+            buzzerState = !buzzerState;
+            if (buzzerState) {
+                // Try direct register write to control buzzer
+                GPIOA->DATA = GPIOA->DATA | BUZZER_PIN;  // Turn buzzer on
+            } else {
+                GPIOA->DATA = GPIOA->DATA & ~BUZZER_PIN; // Turn buzzer off
+            }
+        } 
+        else if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
+            // Parking assist active - handle proximity alerts
             if (xSemaphoreTake(rgbLedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 // Set RGB LED based on distance
                 if (currentDistance < DANGER_ZONE) {
@@ -407,8 +515,9 @@ void AlertHandlerTask(void *pvParameters) {
                 }
                 xSemaphoreGive(buzzerMutex);
             }
-        } else {
-            // Parking assist not active - turn off all indicators
+        } 
+        else {
+            // No active warnings - turn off all indicators
             if (xSemaphoreTake(rgbLedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 GPIOF->DATA &= ~(RED_PIN | BLUE_PIN | GREEN_PIN);
                 xSemaphoreGive(rgbLedMutex);
@@ -420,11 +529,11 @@ void AlertHandlerTask(void *pvParameters) {
                 buzzerState = false;
             }
             
-            // Use a standard delay when not in active mode
+            // Standard delay when idle
             buzzerDelay = pdMS_TO_TICKS(200);
         }
         
-        // Wait for the next alert cycle - this controls the buzzer beep frequency
+        // Wait for the next alert cycle
         vTaskDelayUntil(&lastWakeTime, buzzerDelay);
     }
 }
@@ -438,29 +547,45 @@ void DisplayUpdateTask(void *pvParameters) {
     uint32_t currentDistance = 0xFFFFFFFF; // Default to a large value
     
     while(1) {
-        // Receive latest speed value from queue with a timeout
+        // Receive latest speed value from queue
         if (xQueuePeek(speedQueue, &currentSpeed, pdMS_TO_TICKS(10)) != pdTRUE) {
             // Queue receive timed out, use last known value
         }
         
-        // Receive latest distance value from queue with a timeout
+        // Receive latest distance value from queue
         if (xQueuePeek(distanceQueue, &currentDistance, pdMS_TO_TICKS(10)) != pdTRUE) {
             // Queue receive timed out, use last known value or default
         }
+        
+        // Door open warning condition - door open while moving
+        bool doorOpenWarning = systemState.driverDoorOpen && 
+                              systemState.ignitionOn && 
+                              currentSpeed > 0;
         
         // Take mutex to access LCD
         if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             // Clear display
             LCD_Clear();
             
-            // Display speed on first line
-            LCD_Set_Cursor(0, 0);
-            LCD_Print("Speed:");
-            
-            // Convert speed to string and display
-            sprintf(speedStr, "%3lu km/h", currentSpeed);
-            LCD_Set_Cursor(0, 7);
-            LCD_Print(speedStr);
+            // If door is open while moving, show warning message on first line
+            if (doorOpenWarning) {
+                LCD_Set_Cursor(0, 0);
+                LCD_Print("DOOR OPEN!");
+                
+                // Still show speed on same line
+                sprintf(speedStr, "%3lu km/h", currentSpeed);
+                LCD_Set_Cursor(0, 10);
+                LCD_Print(speedStr);
+            } else {
+                // Normal speed display
+                LCD_Set_Cursor(0, 0);
+                LCD_Print("Speed:");
+                
+                // Convert speed to string and display
+                sprintf(speedStr, "%3lu km/h", currentSpeed);
+                LCD_Set_Cursor(0, 7);
+                LCD_Print(speedStr);
+            }
             
             // Display gear, ignition, and door/distance status on second line
             LCD_Set_Cursor(1, 0);
@@ -481,11 +606,16 @@ void DisplayUpdateTask(void *pvParameters) {
                     break;
             }
             
-            // If in reverse with parking assist, show distance instead of door status
-            if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
+            // Start with gear and ignition status
+            if (systemState.ignitionOn) {
                 sprintf(statusStr, "%sON ", gearStr);
-                
-                // Show distance in appropriate units and with zone indication
+            } else {
+                sprintf(statusStr, "%sOFF ", gearStr);
+            }
+            
+            // Add appropriate status based on current condition
+            if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
+                // Show distance when in reverse with parking assist
                 if (currentDistance < DANGER_ZONE) {
                     sprintf(distanceStr, "%lucm!", currentDistance);
                 } else if (currentDistance < CAUTION_ZONE) {
@@ -493,28 +623,25 @@ void DisplayUpdateTask(void *pvParameters) {
                 } else {
                     sprintf(distanceStr, "%lucm", currentDistance);
                 }
-                
                 strcat(statusStr, distanceStr);
-            } else {
-                // Standard status display
-                if (systemState.ignitionOn) {
-                    sprintf(statusStr, "%sON ", gearStr);
-                } else {
-                    sprintf(statusStr, "%sOFF ", gearStr);
+            } 
+            else if (systemState.driverDoorOpen) {
+                // Show door open status
+                strcat(statusStr, "DOOR");
+            }
+            else if (systemState.doorsLocked) {
+                // Show locked status when door is closed and locked
+                strcat(statusStr, "LOCK");
+                // If manual override, add indicator
+                if (systemState.manualLockOverride) {
+                    strcat(statusStr, "*");
                 }
-                
-                if (systemState.doorsLocked) {
-                    strcat(statusStr, "LOCK");
-                    // If manual override, add indicator
-                    if (systemState.manualLockOverride) {
-                        strcat(statusStr, "*");
-                    }
-                } else {
-                    strcat(statusStr, "UNLK");
-                    // If manual override, add indicator
-                    if (systemState.manualLockOverride) {
-                        strcat(statusStr, "*");
-                    }
+            } else {
+                // Show unlocked status when door is closed but unlocked
+                strcat(statusStr, "UNLK");
+                // If manual override, add indicator
+                if (systemState.manualLockOverride) {
+                    strcat(statusStr, "*");
                 }
             }
             
