@@ -9,7 +9,7 @@
 TaskHandle_t speedSensingHandle = NULL;
 TaskHandle_t displayUpdateHandle = NULL;
 TaskHandle_t switchMonitorHandle = NULL;
-
+TaskHandle_t ultrasonicTaskHandle = NULL;
 // Semaphore/mutex for LCD access
 SemaphoreHandle_t lcdMutex = NULL;
 
@@ -57,10 +57,44 @@ void switches_init(void) {
     GPIOE->DEN |= (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);   // Enable digital function
 }
 
+// Initialize ultrasonic sensor, RGB LED, and buzzer
+void ultrasonic_system_init(void) {
+    // Enable clocks for required ports
+    SYSCTL->RCGCGPIO |= (1 << 0);  // Enable GPIOA clock for ultrasonic sensor and buzzer
+    // GPIOF clock should already be enabled for the ignition button
+    
+    // Wait for clocks to stabilize
+    while((SYSCTL->PRGPIO & (1 << 0)) == 0) {}
+    
+    // Configure PA2 (Trigger) as output and PA3 (Echo) as input
+    GPIOA->DIR |= TRIG_PIN;        // Set Trigger as output
+    GPIOA->DIR &= ~ECHO_PIN;       // Set Echo as input
+    GPIOA->DEN |= (TRIG_PIN | ECHO_PIN); // Enable digital function
+    
+    // Configure PA4 as output for buzzer
+    GPIOA->DIR |= BUZZER_PIN;      // Set as output
+    GPIOA->DEN |= BUZZER_PIN;      // Enable digital function
+    
+    // Configure PF1 (Red), PF2 (Blue), PF3 (Green) for RGB LED
+    // PF1 and PF2 may require unlocking
+    GPIOF->LOCK = 0x4C4F434B;      // Unlock GPIO registers
+    GPIOF->CR = 0x1F;              // Allow changes to PF0-PF4
+    GPIOF->DIR |= (RED_PIN | BLUE_PIN | GREEN_PIN); // Set as outputs
+    GPIOF->DEN |= (RED_PIN | BLUE_PIN | GREEN_PIN); // Enable digital function
+    
+    // Initialize all outputs to LOW (off)
+    GPIOA->DATA &= ~TRIG_PIN;
+    GPIOA->DATA &= ~BUZZER_PIN;
+    GPIOF->DATA &= ~(RED_PIN | BLUE_PIN | GREEN_PIN);
+}
+
 // Task initialization function
 void tasks_init(void) {
     // Initialize GPIO for switches
     switches_init();
+    
+    // Initialize ultrasonic system
+    ultrasonic_system_init();
     
     // Create mutex for LCD access
     lcdMutex = xSemaphoreCreateMutex();
@@ -73,6 +107,7 @@ void tasks_init(void) {
         xTaskCreate(SpeedSensingTask, "SpeedSensing", configMINIMAL_STACK_SIZE, NULL, 2, &speedSensingHandle);
         xTaskCreate(DisplayUpdateTask, "DisplayUpdate", configMINIMAL_STACK_SIZE, NULL, 1, &displayUpdateHandle);
         xTaskCreate(SwitchMonitorTask, "SwitchMonitor", configMINIMAL_STACK_SIZE, NULL, 3, &switchMonitorHandle);
+        xTaskCreate(UltrasonicTask, "Ultrasonic", configMINIMAL_STACK_SIZE, NULL, 2, &ultrasonicTaskHandle);
     } else {
         // Handle resource creation failure
         while(1) {}
@@ -244,10 +279,108 @@ void SwitchMonitorTask(void *pvParameters) {
     }
 }
 
+void UltrasonicTask(void *pvParameters) {
+    uint32_t distance;
+    uint32_t pulseWidth;
+    uint32_t startTime, endTime;
+    TickType_t lastWakeTime;
+    TickType_t buzzerDelay = pdMS_TO_TICKS(1000); // Default delay (slow beeping)
+    bool buzzerState = false;
+    
+    // Initialize the last wake time
+    lastWakeTime = xTaskGetTickCount();
+    
+    while(1) {
+        // Check if we should activate parking assist (in reverse gear)
+        systemState.parkingAssistActive = (systemState.ignitionOn && 
+                                          systemState.gearPosition == GEAR_REVERSE);
+        
+        if (systemState.parkingAssistActive) {
+            // 1. Clear the trigger pin
+            GPIOA->DATA &= ~TRIG_PIN;
+            vTaskDelay(pdMS_TO_TICKS(2)); // Short delay
+            
+            // 2. Send 10us pulse to trigger
+            GPIOA->DATA |= TRIG_PIN;
+            vTaskDelay(pdMS_TO_TICKS(1)); // Wait for at least 10us (minimum 1 tick)
+            GPIOA->DATA &= ~TRIG_PIN;
+            
+            // 3. Wait for echo pin to go high
+            while((GPIOA->DATA & ECHO_PIN) == 0) {
+                // Add timeout check to prevent getting stuck
+                if (xTaskGetTickCount() - lastWakeTime > pdMS_TO_TICKS(100)) {
+                    break;
+                }
+            }
+            
+            // 4. Measure pulse width (time between rising and falling edge)
+            startTime = xTaskGetTickCount();
+            
+            // Wait for echo pin to go low
+            while((GPIOA->DATA & ECHO_PIN) != 0) {
+                // Add timeout check to prevent getting stuck
+                if (xTaskGetTickCount() - startTime > pdMS_TO_TICKS(100)) {
+                    break;
+                }
+            }
+            
+            endTime = xTaskGetTickCount();
+            
+            // 5. Calculate pulse width in milliseconds
+            pulseWidth = (endTime - startTime);
+            
+            // 6. Convert pulse width to distance (speed of sound is 343 m/s)
+            // Distance = (time * speed of sound) / 2 (divide by 2 because sound travels to object and back)
+            // For HC-SR04: Distance (cm) = pulse width (µs) / 58
+            // Adjust calculation based on tick rate and units
+            distance = (pulseWidth * 343 * 100) / (2 * configTICK_RATE_HZ);
+            
+            // 7. Update system state with the current distance
+            systemState.distanceCm = distance;
+            
+            // 8. Set RGB LED based on distance
+            if (distance < DANGER_ZONE) {
+                // Red - Danger zone
+                GPIOF->DATA = (GPIOF->DATA & ~(BLUE_PIN | GREEN_PIN)) | RED_PIN;
+                buzzerDelay = pdMS_TO_TICKS(100); // Fast beeping (100ms)
+            } else if (distance < CAUTION_ZONE) {
+                // Yellow - Caution zone (Red + Green)
+                GPIOF->DATA = (GPIOF->DATA & ~BLUE_PIN) | (RED_PIN | GREEN_PIN);
+                buzzerDelay = pdMS_TO_TICKS(300); // Medium beeping (300ms)
+            } else {
+                // Green - Safe zone
+                GPIOF->DATA = (GPIOF->DATA & ~(RED_PIN | BLUE_PIN)) | GREEN_PIN;
+                buzzerDelay = pdMS_TO_TICKS(1000); // Slow beeping (1000ms)
+            }
+            
+            // 9. Toggle buzzer based on determined frequency
+            buzzerState = !buzzerState;
+            if (buzzerState) {
+                GPIOA->DATA |= BUZZER_PIN;  // Turn buzzer on
+            } else {
+                GPIOA->DATA &= ~BUZZER_PIN; // Turn buzzer off
+            }
+        } else {
+            // Parking assist not active - turn off all indicators
+            GPIOF->DATA &= ~(RED_PIN | BLUE_PIN | GREEN_PIN);
+            GPIOA->DATA &= ~BUZZER_PIN;
+            buzzerState = false;
+            systemState.distanceCm = 0;
+            
+            // Use a standard delay when not in active mode
+            buzzerDelay = pdMS_TO_TICKS(200);
+        }
+        
+        // Wait for the next cycle
+        vTaskDelayUntil(&lastWakeTime, buzzerDelay);
+    }
+}
+
 void DisplayUpdateTask(void *pvParameters) {
     char speedStr[16];
     char statusStr[16];
     char gearStr[8];
+    char distanceStr[16];
     uint32_t currentSpeed = 0;
     
     while(1) {
@@ -289,24 +422,40 @@ void DisplayUpdateTask(void *pvParameters) {
                     break;
             }
             
-            // Format status string with gear position
-            if (systemState.ignitionOn) {
+            // If in reverse with parking assist, show distance instead of door status
+            if (systemState.parkingAssistActive) {
                 sprintf(statusStr, "%sON ", gearStr);
-            } else {
-                sprintf(statusStr, "%sOFF ", gearStr);
-            }
-            
-            if (systemState.doorsLocked) {
-                strcat(statusStr, "LOCK");
-                // If manual override, add indicator
-                if (systemState.manualLockOverride) {
-                    strcat(statusStr, "*");
+                
+                // Show distance in appropriate units and with zone indication
+                if (systemState.distanceCm < DANGER_ZONE) {
+                    sprintf(distanceStr, "%lucm!", systemState.distanceCm);
+                } else if (systemState.distanceCm < CAUTION_ZONE) {
+                    sprintf(distanceStr, "%lucm", systemState.distanceCm);
+                } else {
+                    sprintf(distanceStr, "%lucm", systemState.distanceCm);
                 }
+                
+                strcat(statusStr, distanceStr);
             } else {
-                strcat(statusStr, "UNLK");
-                // If manual override, add indicator
-                if (systemState.manualLockOverride) {
-                    strcat(statusStr, "*");
+                // Standard status display
+                if (systemState.ignitionOn) {
+                    sprintf(statusStr, "%sON ", gearStr);
+                } else {
+                    sprintf(statusStr, "%sOFF ", gearStr);
+                }
+                
+                if (systemState.doorsLocked) {
+                    strcat(statusStr, "LOCK");
+                    // If manual override, add indicator
+                    if (systemState.manualLockOverride) {
+                        strcat(statusStr, "*");
+                    }
+                } else {
+                    strcat(statusStr, "UNLK");
+                    // If manual override, add indicator
+                    if (systemState.manualLockOverride) {
+                        strcat(statusStr, "*");
+                    }
                 }
             }
             

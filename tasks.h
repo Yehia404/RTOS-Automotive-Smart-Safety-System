@@ -12,6 +12,7 @@
 extern TaskHandle_t speedSensingHandle;
 extern TaskHandle_t displayUpdateHandle;
 extern TaskHandle_t switchMonitorHandle;
+extern TaskHandle_t ultrasonicTaskHandle;
 
 // Semaphore/mutex for LCD access
 extern SemaphoreHandle_t lcdMutex;
@@ -36,6 +37,22 @@ typedef enum
 #define GEAR_DRIVE_PIN (1 << 1)   // PE1 for Drive gear switch
 #define GEAR_REVERSE_PIN (1 << 2) // PE2 for Reverse gear switch
 
+// Pin definitions for ultrasonic sensor (updated)
+#define TRIG_PIN (1 << 2) // PA2 for Trigger pin
+#define ECHO_PIN (1 << 3) // PA3 for Echo pin
+
+// Pin definition for buzzer (updated)
+#define BUZZER_PIN (1 << 4) // PA4 for Buzzer
+
+// Pin definitions for RGB LED
+#define RED_PIN (1 << 1)   // PF1 for Red LED
+#define BLUE_PIN (1 << 2)  // PF2 for Blue LED
+#define GREEN_PIN (1 << 3) // PF3 for Green LED
+
+// Distance zones (in cm)
+#define DANGER_ZONE 30
+#define CAUTION_ZONE 100
+
 // Shared system state
 typedef struct
 {
@@ -44,6 +61,8 @@ typedef struct
     bool ignitionOn;
     bool manualLockOverride;
     GearPosition_t gearPosition; // Added for gear shifter
+    uint32_t distanceCm;         // Distance measurement in cm
+    bool parkingAssistActive;    // Whether parking assist is active
 } SystemState_t;
 
 extern SystemState_t systemState;
@@ -54,9 +73,13 @@ void tasks_init(void);
 // GPIO initialization for switches
 void switches_init(void);
 
+// GPIO initialization for ultrasonic, RGB LED, and buzzer
+void ultrasonic_system_init(void);
+
 // Task functions
 void SpeedSensingTask(void *pvParameters);
 void DisplayUpdateTask(void *pvParameters);
 void SwitchMonitorTask(void *pvParameters);
+void UltrasonicTask(void *pvParameters);
 
 #endif // __TASKS_H__
