@@ -21,7 +21,8 @@ SystemState_t systemState = {
     .currentSpeed = 0,
     .doorsLocked = false,
     .ignitionOn = false,
-    .manualLockOverride = false
+    .manualLockOverride = false,
+    .gearPosition = GEAR_PARK  // Initialize to PARK
 };
 
 // GPIO initialization for switches
@@ -29,22 +30,31 @@ void switches_init(void) {
     // Enable clock for GPIO ports
     SYSCTL->RCGCGPIO |= (1 << 5);  // Enable GPIOF clock for ignition button (PF4)
     SYSCTL->RCGCGPIO |= (1 << 1);  // Enable GPIOB clock for lock/unlock buttons (PB0, PB1)
+    SYSCTL->RCGCGPIO |= (1 << 4);  // Enable GPIOE clock for gear shifter and potentiometer
     
     // Wait for clocks to stabilize
     while((SYSCTL->PRGPIO & (1 << 5)) == 0) {}
     while((SYSCTL->PRGPIO & (1 << 1)) == 0) {}
+    while((SYSCTL->PRGPIO & (1 << 4)) == 0) {}
     
     // Configure PF4 as input with pull-up for ignition switch (push button)
     GPIOF->LOCK = 0x4C4F434B;         // Unlock GPIO registers
     GPIOF->CR = 0x1F;                 // Allow changes to PF4-0
-    GPIOF->DIR &= ~(1 << 4);          // Set as input
-    GPIOF->PUR |= (1 << 4);           // Enable pull-up resistor
-    GPIOF->DEN |= (1 << 4);           // Enable digital function
+    GPIOF->DIR &= ~IGNITION_PIN;      // Set as input
+    GPIOF->PUR |= IGNITION_PIN;       // Enable pull-up resistor
+    GPIOF->DEN |= IGNITION_PIN;       // Enable digital function
     
     // Configure PB0 (Lock button) and PB1 (Unlock button) as inputs with pull-up
-    GPIOB->DIR &= ~(1 << 0 | 1 << 1); // Set as inputs
-    GPIOB->PUR |= (1 << 0 | 1 << 1);  // Enable pull-up resistors
-    GPIOB->DEN |= (1 << 0 | 1 << 1);  // Enable digital function
+    // Note: PB2 and PB3 are used for I2C LCD and configured in I2C initialization
+    GPIOB->DIR &= ~(LOCK_BTN_PIN | UNLOCK_BTN_PIN); // Set as inputs
+    GPIOB->PUR |= (LOCK_BTN_PIN | UNLOCK_BTN_PIN);  // Enable pull-up resistors
+    GPIOB->DEN |= (LOCK_BTN_PIN | UNLOCK_BTN_PIN);  // Enable digital function
+    
+    // Configure PE0, PE1, PE2 as inputs with pull-ups for gear shifter
+    // Note: PE3 is used for potentiometer and configured in ADC initialization
+    GPIOE->DIR &= ~(GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);  // Set as inputs
+    GPIOE->PUR |= (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);   // Enable pull-up resistors
+    GPIOE->DEN |= (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);   // Enable digital function
 }
 
 // Task initialization function
@@ -80,8 +90,10 @@ void SpeedSensingTask(void *pvParameters) {
     const uint32_t SPEED_MAX = 180;
     
     while(1) {
-        // Only measure speed if ignition is ON
-        if (systemState.ignitionOn) {
+        // Only measure speed if ignition is ON and gear is in Drive or Reverse
+        if (systemState.ignitionOn && 
+            (systemState.gearPosition == GEAR_DRIVE || systemState.gearPosition == GEAR_REVERSE)) {
+            
             // Read potentiometer value from ADC
             adcValue = ADC0_ReadChannel(0);
             
@@ -104,7 +116,7 @@ void SpeedSensingTask(void *pvParameters) {
                 systemState.doorsLocked = true;
             }
         } else {
-            // Ignition is OFF, set speed to 0
+            // Ignition is OFF or gear is in Park, set speed to 0
             speedValue = 0;
         }
         
@@ -128,14 +140,32 @@ void SwitchMonitorTask(void *pvParameters) {
     bool currIgnitionBtn;
     bool currLockBtn;
     bool currUnlockBtn;
+    uint8_t gearSwitches;
     
     const TickType_t debounceDelay = pdMS_TO_TICKS(50);  // 50ms debounce delay
     
     while(1) {
         // Read all button states (active low with pull-up resistors)
-        currIgnitionBtn = (GPIOF->DATA & (1 << 4)) ? true : false;  // PF4 for ignition
-        currLockBtn = (GPIOB->DATA & (1 << 0)) ? true : false;      // PB0 for lock
-        currUnlockBtn = (GPIOB->DATA & (1 << 1)) ? true : false;    // PB1 for unlock
+        currIgnitionBtn = (GPIOF->DATA & IGNITION_PIN) ? true : false;     // PF4 for ignition
+        currLockBtn = (GPIOB->DATA & LOCK_BTN_PIN) ? true : false;         // PB0 for lock
+        currUnlockBtn = (GPIOB->DATA & UNLOCK_BTN_PIN) ? true : false;     // PB1 for unlock
+        
+        // Read gear position from switches (active low with pull-ups)
+        // Read only the relevant bits (PE0-PE2)
+        gearSwitches = (~GPIOE->DATA) & (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);
+        
+        // Update gear position based on switch setting
+        // This assumes that only one switch is active at a time
+        if (gearSwitches & GEAR_PARK_PIN) {
+            systemState.gearPosition = GEAR_PARK;
+        } else if (gearSwitches & GEAR_DRIVE_PIN) {
+            systemState.gearPosition = GEAR_DRIVE;
+        } else if (gearSwitches & GEAR_REVERSE_PIN) {
+            systemState.gearPosition = GEAR_REVERSE;
+        } else {
+            // Default to PARK if no switch is active or multiple switches are active
+            systemState.gearPosition = GEAR_PARK;
+        }
         
         // Check for ignition button press (HIGH to LOW transition)
         if (prevIgnitionBtn == true && currIgnitionBtn == false) {
@@ -143,7 +173,7 @@ void SwitchMonitorTask(void *pvParameters) {
             vTaskDelay(debounceDelay);
             
             // Read button state again to confirm press
-            currIgnitionBtn = (GPIOF->DATA & (1 << 4)) ? true : false;
+            currIgnitionBtn = (GPIOF->DATA & IGNITION_PIN) ? true : false;
             
             if (currIgnitionBtn == false) {
                 // Toggle ignition state
@@ -163,7 +193,7 @@ void SwitchMonitorTask(void *pvParameters) {
             vTaskDelay(debounceDelay);
             
             // Read button state again to confirm press
-            currLockBtn = (GPIOB->DATA & (1 << 0)) ? true : false;
+            currLockBtn = (GPIOB->DATA & LOCK_BTN_PIN) ? true : false;
             
             if (currLockBtn == false) {
                 // Manually lock doors
@@ -179,7 +209,7 @@ void SwitchMonitorTask(void *pvParameters) {
             vTaskDelay(debounceDelay);
             
             // Read button state again to confirm press
-            currUnlockBtn = (GPIOB->DATA & (1 << 1)) ? true : false;
+            currUnlockBtn = (GPIOB->DATA & UNLOCK_BTN_PIN) ? true : false;
             
             if (currUnlockBtn == false) {
                 // Manually unlock doors
@@ -192,13 +222,13 @@ void SwitchMonitorTask(void *pvParameters) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                     
                     // Exit early if another button was pressed
-                    if ((GPIOB->DATA & (1 << 0)) == 0 || (GPIOB->DATA & (1 << 1)) == 0) {
+                    if ((GPIOB->DATA & LOCK_BTN_PIN) == 0 || (GPIOB->DATA & UNLOCK_BTN_PIN) == 0) {
                         break;
                     }
                 }
                 
                 // Reset manual override flag after delay (unless another button press occurred)
-                if ((GPIOB->DATA & (1 << 0)) && (GPIOB->DATA & (1 << 1))) {
+                if ((GPIOB->DATA & LOCK_BTN_PIN) && (GPIOB->DATA & UNLOCK_BTN_PIN)) {
                     systemState.manualLockOverride = false;
                 }
             }
@@ -217,6 +247,7 @@ void SwitchMonitorTask(void *pvParameters) {
 void DisplayUpdateTask(void *pvParameters) {
     char speedStr[16];
     char statusStr[16];
+    char gearStr[8];
     uint32_t currentSpeed = 0;
     
     while(1) {
@@ -239,14 +270,30 @@ void DisplayUpdateTask(void *pvParameters) {
             LCD_Set_Cursor(0, 7);
             LCD_Print(speedStr);
             
-            // Display door and ignition status on second line
+            // Display gear, ignition, and door status on second line
             LCD_Set_Cursor(1, 0);
             
-            // Format status string
+            // Get gear string
+            switch(systemState.gearPosition) {
+                case GEAR_PARK:
+                    strcpy(gearStr, "P ");
+                    break;
+                case GEAR_REVERSE:
+                    strcpy(gearStr, "R ");
+                    break;
+                case GEAR_DRIVE:
+                    strcpy(gearStr, "D ");
+                    break;
+                default:
+                    strcpy(gearStr, "? ");
+                    break;
+            }
+            
+            // Format status string with gear position
             if (systemState.ignitionOn) {
-                sprintf(statusStr, "IGN:ON ");
+                sprintf(statusStr, "%sON ", gearStr);
             } else {
-                sprintf(statusStr, "IGN:OFF ");
+                sprintf(statusStr, "%sOFF ", gearStr);
             }
             
             if (systemState.doorsLocked) {
@@ -256,7 +303,7 @@ void DisplayUpdateTask(void *pvParameters) {
                     strcat(statusStr, "*");
                 }
             } else {
-                strcat(statusStr, "UNLOCK");
+                strcat(statusStr, "UNLK");
                 // If manual override, add indicator
                 if (systemState.manualLockOverride) {
                     strcat(statusStr, "*");
