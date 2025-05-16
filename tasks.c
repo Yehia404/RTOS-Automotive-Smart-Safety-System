@@ -141,10 +141,10 @@ void SpeedSensingTask(void *pvParameters) {
     uint32_t speedValue;
     
     // Define the expected ADC range based on your potentiometer behavior
-    const uint32_t ADC_MIN = 450;      // Value when pot is at minimum
-    const uint32_t ADC_MAX = 3800;     // Value when pot is at maximum
+    const uint32_t ADC_MIN = 300;      // Value when pot is at minimum
+    const uint32_t ADC_MAX = 3900;     // Value when pot is at maximum
     const uint32_t SPEED_MIN = 0;
-    const uint32_t SPEED_MAX = 180;
+    const uint32_t SPEED_MAX = 220;
     
     while(1) {
         // Only measure speed if ignition is ON and gear is in Drive or Reverse
@@ -214,17 +214,21 @@ void SwitchMonitorTask(void *pvParameters) {
         // Read only the relevant bits (PE0-PE2)
         gearSwitches = (~GPIOE->DATA) & (GEAR_PARK_PIN | GEAR_DRIVE_PIN | GEAR_REVERSE_PIN);
         
-        // Update gear position based on switch setting
-        if (gearSwitches & GEAR_PARK_PIN) {
-            systemState.gearPosition = GEAR_PARK;
-        } else if (gearSwitches & GEAR_DRIVE_PIN) {
-            systemState.gearPosition = GEAR_DRIVE;
-        } else if (gearSwitches & GEAR_REVERSE_PIN) {
-            systemState.gearPosition = GEAR_REVERSE;
-        } else {
-            // Default to PARK if no switch is active or multiple switches are active
-            systemState.gearPosition = GEAR_PARK;
+        // Update gear position based on switch setting and ignition state
+        if (systemState.ignitionOn) {
+            // Only allow gear changes when ignition is ON
+            if (gearSwitches & GEAR_PARK_PIN) {
+                systemState.gearPosition = GEAR_PARK;
+            } else if (gearSwitches & GEAR_DRIVE_PIN) {
+                systemState.gearPosition = GEAR_DRIVE;
+            } else if (gearSwitches & GEAR_REVERSE_PIN) {
+                systemState.gearPosition = GEAR_REVERSE;
+            } else {
+                // Default to PARK if no switch is active or multiple switches are active
+                systemState.gearPosition = GEAR_PARK;
+            }
         }
+        // When ignition is OFF, the gear position remains unchanged regardless of switch position
         
         // Check for ignition button press (HIGH to LOW transition)
         if (prevIgnitionBtn == true && currIgnitionBtn == false) {
@@ -545,110 +549,147 @@ void DisplayUpdateTask(void *pvParameters) {
     char distanceStr[16];
     uint32_t currentSpeed = 0;
     uint32_t currentDistance = 0xFFFFFFFF; // Default to a large value
+    bool prevIgnitionState = false;
+    
+    // Initialize previous ignition state
+    prevIgnitionState = systemState.ignitionOn;
+    
+    // Initial LCD state - ensure it's off if ignition is off at startup
+    if (!systemState.ignitionOn) {
+        if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            LCD_Power_Off();
+            xSemaphoreGive(lcdMutex);
+        }
+    } else {
+        // Make sure LCD is initialized if ignition is on at startup
+        if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            LCD_Power_On();
+            xSemaphoreGive(lcdMutex);
+        }
+    }
     
     while(1) {
-        // Receive latest speed value from queue
-        if (xQueuePeek(speedQueue, &currentSpeed, pdMS_TO_TICKS(10)) != pdTRUE) {
-            // Queue receive timed out, use last known value
-        }
-        
-        // Receive latest distance value from queue
-        if (xQueuePeek(distanceQueue, &currentDistance, pdMS_TO_TICKS(10)) != pdTRUE) {
-            // Queue receive timed out, use last known value or default
-        }
-        
-        // Door open warning condition - door open while moving
-        bool doorOpenWarning = systemState.driverDoorOpen && 
-                              systemState.ignitionOn && 
-                              currentSpeed > 0;
-        
-        // Take mutex to access LCD
-        if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // Clear display
-            LCD_Clear();
-            
-            // If door is open while moving, show warning message on first line
-            if (doorOpenWarning) {
-                LCD_Set_Cursor(0, 0);
-                LCD_Print("DOOR OPEN!");
-                
-                // Still show speed on same line
-                sprintf(speedStr, "%3lu km/h", currentSpeed);
-                LCD_Set_Cursor(0, 10);
-                LCD_Print(speedStr);
-            } else {
-                // Normal speed display
-                LCD_Set_Cursor(0, 0);
-                LCD_Print("Speed:");
-                
-                // Convert speed to string and display
-                sprintf(speedStr, "%3lu km/h", currentSpeed);
-                LCD_Set_Cursor(0, 7);
-                LCD_Print(speedStr);
-            }
-            
-            // Display gear, ignition, and door/distance status on second line
-            LCD_Set_Cursor(1, 0);
-            
-            // Get gear string
-            switch(systemState.gearPosition) {
-                case GEAR_PARK:
-                    strcpy(gearStr, "P ");
-                    break;
-                case GEAR_REVERSE:
-                    strcpy(gearStr, "R ");
-                    break;
-                case GEAR_DRIVE:
-                    strcpy(gearStr, "D ");
-                    break;
-                default:
-                    strcpy(gearStr, "? ");
-                    break;
-            }
-            
-            // Start with gear and ignition status
+        // Check for ignition state change
+        if (prevIgnitionState != systemState.ignitionOn) {
             if (systemState.ignitionOn) {
-                sprintf(statusStr, "%sON ", gearStr);
-            } else {
-                sprintf(statusStr, "%sOFF ", gearStr);
-            }
-            
-            // Add appropriate status based on current condition
-            if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
-                // Show distance when in reverse with parking assist
-                if (currentDistance < DANGER_ZONE) {
-                    sprintf(distanceStr, "%lucm!", currentDistance);
-                } else if (currentDistance < CAUTION_ZONE) {
-                    sprintf(distanceStr, "%lucm", currentDistance);
-                } else {
-                    sprintf(distanceStr, "%lucm", currentDistance);
-                }
-                strcat(statusStr, distanceStr);
-            } 
-            else if (systemState.driverDoorOpen) {
-                // Show door open status
-                strcat(statusStr, "DOOR");
-            }
-            else if (systemState.doorsLocked) {
-                // Show locked status when door is closed and locked
-                strcat(statusStr, "LOCK");
-                // If manual override, add indicator
-                if (systemState.manualLockOverride) {
-                    strcat(statusStr, "*");
+                // Ignition turned ON - power up LCD
+                if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    LCD_Power_On();
+                    xSemaphoreGive(lcdMutex);
                 }
             } else {
-                // Show unlocked status when door is closed but unlocked
-                strcat(statusStr, "UNLK");
-                // If manual override, add indicator
-                if (systemState.manualLockOverride) {
-                    strcat(statusStr, "*");
+                // Ignition turned OFF - power down LCD
+                if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    LCD_Power_Off();
+                    xSemaphoreGive(lcdMutex);
                 }
             }
+            prevIgnitionState = systemState.ignitionOn;
+        }
+        
+        // Only update LCD if ignition is ON
+        if (systemState.ignitionOn) {
+            // Receive latest speed value from queue
+            if (xQueuePeek(speedQueue, &currentSpeed, pdMS_TO_TICKS(10)) != pdTRUE) {
+                // Queue receive timed out, use last known value
+            }
             
-            LCD_Print(statusStr);
+            // Receive latest distance value from queue
+            if (xQueuePeek(distanceQueue, &currentDistance, pdMS_TO_TICKS(10)) != pdTRUE) {
+                // Queue receive timed out, use last known value or default
+            }
             
-            // Release the mutex
-            xSemaphoreGive(lcdMutex);
+            // Door open warning condition - door open while moving
+            bool doorOpenWarning = systemState.driverDoorOpen && 
+                                  systemState.ignitionOn && 
+                                  currentSpeed > 0;
+            
+            // Take mutex to access LCD
+            if (xSemaphoreTake(lcdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (LCD_Is_Powered()) {  // Double-check power state before updating
+                    // Clear display
+                    LCD_Clear();
+                    
+                    // If door is open while moving, show warning message on first line
+                    if (doorOpenWarning) {
+                        LCD_Set_Cursor(0, 0);
+                        LCD_Print("DOOR OPEN!");
+                        
+                        // Still show speed on same line
+                        sprintf(speedStr, "%3lu km/h", currentSpeed);
+                        LCD_Set_Cursor(0, 10);
+                        LCD_Print(speedStr);
+                    } else {
+                        // Normal speed display
+                        LCD_Set_Cursor(0, 0);
+                        LCD_Print("Speed:");
+                        
+                        // Convert speed to string and display
+                        sprintf(speedStr, "%3lu km/h", currentSpeed);
+                        LCD_Set_Cursor(0, 7);
+                        LCD_Print(speedStr);
+                    }
+                    
+                    // Display gear, ignition, and door/distance status on second line
+                    LCD_Set_Cursor(1, 0);
+                    
+                    // Get gear string
+                    switch(systemState.gearPosition) {
+                        case GEAR_PARK:
+                            strcpy(gearStr, "P ");
+                            break;
+                        case GEAR_REVERSE:
+                            strcpy(gearStr, "R ");
+                            break;
+                        case GEAR_DRIVE:
+                            strcpy(gearStr, "D ");
+                            break;
+                        default:
+                            strcpy(gearStr, "? ");
+                            break;
+                    }
+                    
+                    // Start with gear and ignition status
+                    sprintf(statusStr, "%sON ", gearStr);
+                    
+                    // Add appropriate status based on current condition
+                    if (systemState.parkingAssistActive && currentDistance != 0xFFFFFFFF) {
+                        // Show distance when in reverse with parking assist
+                        if (currentDistance < DANGER_ZONE) {
+                            sprintf(distanceStr, "%lucm!", currentDistance);
+                        } else if (currentDistance < CAUTION_ZONE) {
+                            sprintf(distanceStr, "%lucm", currentDistance);
+                        } else {
+                            sprintf(distanceStr, "%lucm", currentDistance);
+                        }
+                        strcat(statusStr, distanceStr);
+                    } 
+                    else if (systemState.driverDoorOpen) {
+                        // Show door open status
+                        strcat(statusStr, "DOOR");
+                    }
+                    else if (systemState.doorsLocked) {
+                        // Show locked status when door is closed and locked
+                        strcat(statusStr, "LOCK");
+                        // If manual override, add indicator
+                        if (systemState.manualLockOverride) {
+                            strcat(statusStr, "*");
+                        }
+                    } else {
+                        // Show unlocked status when door is closed but unlocked
+                        strcat(statusStr, "UNLK");
+                        // If manual override, add indicator
+                        if (systemState.manualLockOverride) {
+                            strcat(statusStr, "*");
+                        }
+                    }
+                    
+                    LCD_Print(statusStr);
+                }
+                
+                // Release the mutex
+                xSemaphoreGive(lcdMutex);
+            }
         }
         
         // Task delay (200ms)

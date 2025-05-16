@@ -386,21 +386,6 @@
           <GroupName>Source Group 1</GroupName>
           <Files>
             <File>
-              <FileName>basic_io.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\basic_io.c</FilePath>
-            </File>
-            <File>
-              <FileName>consoleprint.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\consoleprint.c</FilePath>
-            </File>
-            <File>
-              <FileName>retarget.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\retarget.c</FilePath>
-            </File>
-            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\main.c</FilePath>

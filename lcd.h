@@ -38,6 +38,9 @@
 #define Rw 0x02 // Read/Write bit
 #define Rs 0x01 // Register select bit
 
+// Global LCD power state flag
+extern bool lcd_powered;
+
 // Function prototypes
 void LCD_Write_Nibble(uint8_t nibble, uint8_t rs);
 void LCD_Write_Byte(uint8_t data, uint8_t rs);
@@ -45,5 +48,8 @@ void LCD_Init(void);
 void LCD_Clear(void);
 void LCD_Set_Cursor(uint8_t row, uint8_t col);
 void LCD_Print(char *str);
+void LCD_Power_On(void);
+void LCD_Power_Off(void);
+bool LCD_Is_Powered(void);
 
 #endif // __LCD_H__

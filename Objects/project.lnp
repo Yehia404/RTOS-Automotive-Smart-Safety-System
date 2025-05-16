@@ -1,7 +1,4 @@
 --cpu=Cortex-M4.fp.sp
-".\objects\basic_io.o"
-".\objects\consoleprint.o"
-".\objects\retarget.o"
 ".\objects\main.o"
 ".\objects\delay.o"
 ".\objects\i2c.o"
